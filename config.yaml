@@ -1,0 +1,61 @@
+# FYP Configuration File
+
+# Dataset Configuration
+data:
+  dataset: "mitbih"
+  data_dir: "data/mitdb"
+  processed_dir: "data/processed"
+  partitioned_dir: "data/partitioned"
+  
+  # ECG Processing
+  sampling_rate: 360
+  window_size: 360
+  
+  # Non-IID Partitioning
+  num_clients: 3
+  
+  # Client distributions
+  client_distributions:
+    client_1:
+      normal: 0.60
+      ventricular: 0.30
+      rare: 0.10
+      data_fraction: 0.40
+    
+    client_2:
+      normal: 0.85
+      ventricular: 0.10
+      rare: 0.05
+      data_fraction: 0.35
+    
+    client_3:
+      normal: 0.50
+      ventricular: 0.30
+      rare: 0.20
+      data_fraction: 0.25
+  
+  # Splits
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# Model Configuration
+model:
+  architecture: "cnn_lstm"
+  num_classes: 5
+  cnn_channels: [32, 64, 128]
+  lstm_hidden_size: 128
+  lstm_num_layers: 2
+  dropout: 0.5
+  learning_rate: 0.001
+
+# Training
+training:
+  batch_size: 32
+  epochs: 50
+  device: "cpu"
+
+# Federated Learning
+federated:
+  num_rounds: 20
+  local_epochs: 5

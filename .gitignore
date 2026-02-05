@@ -1,6 +1,26 @@
-runs/
+# Python
 __pycache__/
-*.pyc
-*.pkl
-*.log
-.ipynb_checkpoints/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Data files
+data/mitdb/*.dat
+data/mitdb/*.hea
+data/mitdb/*.atr
+data/processed/
+data/partitioned/
+
+# Model files
+experiments/*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
