@@ -150,6 +150,111 @@ class BlockchainManager:
             print(f"  Hash: {update['model_hash'][:16]}...")
             print()
 
+# ==========================================
+    # SYNTHETIC DATA GOVERNANCE (Phase 4)
+    # ==========================================
+    
+    def set_synthetic_quota(self, client_id, quota):
+        """Set synthetic data quota for a client"""
+        
+        tx_hash = self.contract.functions.setSyntheticQuota(
+            client_id,
+            quota
+        ).transact({'from': self.deployer})
+        
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        return receipt
+    
+    def request_synthetic(self, client_id, class_label, quantity):
+        """
+        Request synthetic data generation
+        
+        Returns:
+            request_id: ID of the request
+        """
+        
+        tx_hash = self.contract.functions.requestSynthetic(
+            int(client_id),
+            int(class_label),  # Convert numpy int64 to Python int
+            int(quantity)
+        ).transact({'from': self.deployer})
+        
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        # Get request ID from logs
+        request_id = self.contract.functions.getTotalSyntheticRequests().call() - 1
+        
+        return request_id
+    
+    def approve_synthetic(self, request_id):
+        """Approve synthetic data request"""
+        
+        tx_hash = self.contract.functions.approveSynthetic(
+            request_id
+        ).transact({'from': self.deployer})
+        
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        return receipt
+    
+    def mark_synthetic_generated(self, request_id):
+        """Mark synthetic data as generated"""
+        
+        tx_hash = self.contract.functions.markSyntheticGenerated(
+            request_id
+        ).transact({'from': self.deployer})
+        
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        return receipt
+    
+    def get_synthetic_request(self, request_id):
+        """Get details of synthetic request"""
+        
+        request = self.contract.functions.getSyntheticRequest(request_id).call()
+        
+        return {
+            'client_id': request[0],
+            'class_label': request[1],
+            'quantity': request[2],
+            'approved': request[3],
+            'generated': request[4],
+            'timestamp': request[5]
+        }
+    
+    def get_quota(self, client_id):
+        """Get remaining synthetic quota for client"""
+        
+        return self.contract.functions.getQuota(client_id).call()
+    
+    def print_synthetic_audit(self):
+        """Print synthetic data audit trail"""
+        
+        total_requests = self.contract.functions.getTotalSyntheticRequests().call()
+        
+        if total_requests == 0:
+            print("\nNo synthetic data requests logged.")
+            return
+        
+        print("\n" + "=" * 60)
+        print("SYNTHETIC DATA AUDIT TRAIL")
+        print("=" * 60)
+        print(f"Total requests: {total_requests}\n")
+        
+        for i in range(total_requests):
+            request = self.get_synthetic_request(i)
+            
+            status = "✅ Generated" if request['generated'] else ("⏳ Approved" if request['approved'] else "❌ Pending")
+            
+            print(f"Request #{i}:")
+            print(f"  Client: {request['client_id']}")
+            print(f"  Class: {request['class_label']}")
+            print(f"  Quantity: {request['quantity']}")
+            print(f"  Status: {status}")
+            print()
+
+
 # Test
 if __name__ == "__main__":
     bm = BlockchainManager()

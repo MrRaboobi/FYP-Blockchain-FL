@@ -133,4 +133,168 @@ contract FLLogger {
             update.accuracy
         );
     }
+    // ==========================================
+    // SYNTHETIC DATA GOVERNANCE (Phase 4)
+    // ==========================================
+    
+    struct SyntheticRequest {
+        uint256 requestId;
+        uint256 clientId;
+        uint256 classLabel;
+        uint256 quantity;
+        bool approved;
+        bool generated;
+        uint256 timestamp;
+    }
+    
+    SyntheticRequest[] public syntheticRequests;
+    
+    mapping(uint256 => uint256[]) public clientSyntheticRequests;  // clientId => requestIds
+    mapping(uint256 => uint256) public syntheticQuota;  // clientId => remaining quota
+    
+    event SyntheticRequested(
+        uint256 indexed requestId,
+        uint256 indexed clientId,
+        uint256 classLabel,
+        uint256 quantity,
+        uint256 timestamp
+    );
+    
+    event SyntheticApproved(
+        uint256 indexed requestId,
+        uint256 indexed clientId,
+        uint256 quantity,
+        uint256 timestamp
+    );
+    
+    event SyntheticGenerated(
+        uint256 indexed requestId,
+        uint256 indexed clientId,
+        uint256 classLabel,
+        uint256 quantity,
+        uint256 timestamp
+    );
+    
+    /**
+     * @dev Initialize synthetic data quota for a client
+     * @param _clientId Client identifier
+     * @param _quota Maximum synthetic samples allowed
+     */
+    function setSyntheticQuota(uint256 _clientId, uint256 _quota) public {
+        syntheticQuota[_clientId] = _quota;
+    }
+    
+    /**
+     * @dev Request synthetic data generation
+     * @param _clientId Client identifier
+     * @param _classLabel Class to generate samples for
+     * @param _quantity Number of samples requested
+     */
+    function requestSynthetic(
+        uint256 _clientId,
+        uint256 _classLabel,
+        uint256 _quantity
+    ) public returns (uint256) {
+        
+        uint256 requestId = syntheticRequests.length;
+        
+        SyntheticRequest memory newRequest = SyntheticRequest({
+            requestId: requestId,
+            clientId: _clientId,
+            classLabel: _classLabel,
+            quantity: _quantity,
+            approved: false,
+            generated: false,
+            timestamp: block.timestamp
+        });
+        
+        syntheticRequests.push(newRequest);
+        clientSyntheticRequests[_clientId].push(requestId);
+        
+        emit SyntheticRequested(requestId, _clientId, _classLabel, _quantity, block.timestamp);
+        
+        return requestId;
+    }
+    
+    /**
+     * @dev Approve synthetic data request
+     * @param _requestId Request identifier
+     */
+    function approveSynthetic(uint256 _requestId) public {
+        require(_requestId < syntheticRequests.length, "Request does not exist");
+        
+        SyntheticRequest storage request = syntheticRequests[_requestId];
+        require(!request.approved, "Already approved");
+        
+        // Check quota
+        uint256 clientId = request.clientId;
+        require(syntheticQuota[clientId] >= request.quantity, "Quota exceeded");
+        
+        // Approve
+        request.approved = true;
+        syntheticQuota[clientId] -= request.quantity;
+        
+        emit SyntheticApproved(_requestId, clientId, request.quantity, block.timestamp);
+    }
+    
+    /**
+     * @dev Mark synthetic data as generated
+     * @param _requestId Request identifier
+     */
+    function markSyntheticGenerated(uint256 _requestId) public {
+        require(_requestId < syntheticRequests.length, "Request does not exist");
+        
+        SyntheticRequest storage request = syntheticRequests[_requestId];
+        require(request.approved, "Not approved");
+        require(!request.generated, "Already generated");
+        
+        request.generated = true;
+        
+        emit SyntheticGenerated(
+            _requestId,
+            request.clientId,
+            request.classLabel,
+            request.quantity,
+            block.timestamp
+        );
+    }
+    
+    /**
+     * @dev Get synthetic request details
+     * @param _requestId Request identifier
+     */
+    function getSyntheticRequest(uint256 _requestId) public view returns (
+        uint256 clientId,
+        uint256 classLabel,
+        uint256 quantity,
+        bool approved,
+        bool generated,
+        uint256 timestamp
+    ) {
+        require(_requestId < syntheticRequests.length, "Request does not exist");
+        SyntheticRequest memory request = syntheticRequests[_requestId];
+        return (
+            request.clientId,
+            request.classLabel,
+            request.quantity,
+            request.approved,
+            request.generated,
+            request.timestamp
+        );
+    }
+    
+    /**
+     * @dev Get total synthetic requests
+     */
+    function getTotalSyntheticRequests() public view returns (uint256) {
+        return syntheticRequests.length;
+    }
+    
+    /**
+     * @dev Get client's remaining quota
+     */
+    function getQuota(uint256 _clientId) public view returns (uint256) {
+        return syntheticQuota[_clientId];
+    }
 }
+
