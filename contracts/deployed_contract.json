@@ -1,6 +1,37 @@
 {
-  "address": "0x0cc319dbD2C71f079c9F4A5e23F61c1735E4d195",
+  "address": "0xA37e719489db1CD6CC01954b4137cF75E3061514",
   "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "client",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "round",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "accuracy",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "timestamp",
+          "type": "uint256"
+        }
+      ],
+      "name": "ModelUpdate",
+      "type": "event"
+    },
     {
       "anonymous": false,
       "inputs": [
@@ -637,5 +668,5 @@
       "type": "function"
     }
   ],
-  "deployer": "0x7228226Adb93C978C6A6fdB1152f44528476b26A"
+  "deployer": "0xFa5A8Ab6c1199892E43930D60b8183187A70c112"
 }

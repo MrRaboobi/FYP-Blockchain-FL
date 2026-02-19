@@ -8,7 +8,7 @@ pragma solidity ^0.8.0;
 contract FLLogger {
     
     // Structure to store update information
-    struct ModelUpdate {
+    struct ModelUpdateRecord {
         uint256 round;
         uint256 clientId;
         bytes32 modelHash;
@@ -18,7 +18,7 @@ contract FLLogger {
     }
     
     // Array to store all updates
-    ModelUpdate[] public updates;
+    ModelUpdateRecord[] public updates;
     
     // Mapping: round => array of update indices
     mapping(uint256 => uint256[]) public roundUpdates;
@@ -39,6 +39,13 @@ contract FLLogger {
         uint256 numClients,
         uint256 timestamp
     );
+
+    event ModelUpdate(
+        address indexed client,
+        uint256 round,
+        uint256 accuracy,
+        uint256 timestamp
+    );
     
     /**
      * @dev Log a model update from a client
@@ -57,7 +64,7 @@ contract FLLogger {
     ) public {
         
         // Create update record
-        ModelUpdate memory newUpdate = ModelUpdate({
+        ModelUpdateRecord memory newUpdate = ModelUpdateRecord({
             round: _round,
             clientId: _clientId,
             modelHash: _modelHash,
@@ -74,8 +81,9 @@ contract FLLogger {
         roundUpdates[_round].push(updateIndex);
         clientUpdates[_clientId].push(updateIndex);
         
-        // Emit event
+        // Emit events
         emit UpdateLogged(_round, _clientId, _modelHash, block.timestamp);
+        emit ModelUpdate(msg.sender, _round, _accuracy, block.timestamp);
     }
     
     /**
@@ -123,7 +131,7 @@ contract FLLogger {
         uint256 accuracy
     ) {
         require(_index < updates.length, "Update does not exist");
-        ModelUpdate memory update = updates[_index];
+        ModelUpdateRecord memory update = updates[_index];
         return (
             update.round,
             update.clientId,

@@ -255,6 +255,42 @@ class BlockchainManager:
             print()
 
 
+
+def fetch_client_history(client_address, contract, web3_instance):
+    """
+    Query past ModelUpdate events for the given client_address.
+
+    Args:
+        client_address (str): Ethereum address of the client (checksummed or not).
+        contract: Web3 contract instance with the FLLogger ABI.
+        web3_instance: Active Web3 connection.
+
+    Returns:
+        list[dict]: Each dict contains:
+            'round'     (int)   - federated learning round number
+            'accuracy'  (float) - accuracy as float (stored integer / 10000)
+            'timestamp' (int)   - Unix timestamp of the on-chain event
+    """
+    checksum_addr = web3_instance.to_checksum_address(client_address)
+
+    event_filter = contract.events.ModelUpdate.create_filter(
+        from_block=0,
+        argument_filters={'client': checksum_addr}
+    )
+    raw_logs = event_filter.get_all_entries()
+
+    history = []
+    for log in raw_logs:
+        args = log['args']
+        history.append({
+            'round':     int(args['round']),
+            'accuracy':  int(args['accuracy']) / 10000.0,
+            'timestamp': int(args['timestamp'])
+        })
+
+    return history
+
+
 # Test
 if __name__ == "__main__":
     bm = BlockchainManager()
