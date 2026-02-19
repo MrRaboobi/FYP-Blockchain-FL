@@ -12,7 +12,7 @@ data:
   window_size: 360
   
   # Non-IID Partitioning
-  num_clients: 3
+  num_clients: 10
   
   # Client distributions
   client_distributions:

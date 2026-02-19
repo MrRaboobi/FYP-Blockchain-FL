@@ -18,14 +18,15 @@ def download_mitbih():
     print("=" * 60)
     
     # Load config
+    
     config = load_config()
     data_dir = config['data']['data_dir']
     
     # Create directory
     os.makedirs(data_dir, exist_ok=True)
     
-    # MIT-BIH record IDs (starting with 3 for testing)
-    test_records = [100, 101, 102]
+    # MIT-BIH record IDs — 15 records for 10-client experiment
+    test_records = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 111, 112, 113, 114, 115]
     
     print(f"\nDownloading {len(test_records)} test records...")
     print(f"Target directory: {os.path.abspath(data_dir)}\n")

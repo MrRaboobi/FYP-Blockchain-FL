@@ -1,13 +1,13 @@
 """
 Flower Server Strategy — Proof-of-Contribution (PoC) Active-Ledger Orchestration.
-Phase 1.4 — Active Orchestration
+Phase 1.4 — Active Orchestration (v2: corrected PoC bounds, EMA weighting)
 """
 
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 import flwr as fl
@@ -15,13 +15,8 @@ from flwr.server.strategy import FedAvg
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 from flwr.common import (
-    EvaluateIns,
-    EvaluateRes,
     FitIns,
-    FitRes,
     Parameters,
-    Scalar,
-    parameters_to_ndarrays,
 )
 
 from blockchain import fetch_client_history
@@ -31,36 +26,73 @@ from blockchain import fetch_client_history
 # Proof-of-Contribution helpers
 # ---------------------------------------------------------------------------
 
+def _ema(values: List[float], alpha: float = 0.7) -> float:
+    """
+    Exponential Moving Average (most-recent-first EMA).
+    Entries are assumed to be ordered oldest → newest.
+    Returns the EMA value (same range as the input values).
+    """
+    if not values:
+        return 0.0
+    ema = values[0]
+    for v in values[1:]:
+        ema = alpha * v + (1.0 - alpha) * ema
+    return ema
+
+
 def calculate_score(history: List[Dict]) -> float:
     """
-    Compute a Proof-of-Contribution (PoC) reputation score from a client's
-    on-chain history.
+    Proof-of-Contribution (PoC) reputation score derived from on-chain history.
+
+    The on-chain `accuracy` field is stored as an integer (accuracy × 10000).
+    This function normalises it by dividing by 10000.0 before computing the
+    score.
+
+    Score formula:
+        ema_acc   = EMA(normalised accuracy values, alpha=0.7)
+        max_round = highest round index seen in history
+        participation = len(history) / max_round   (← always ≤ 1)
+        raw_score = ema_acc × participation
+
+    The final score is clamped strictly to (0, 1) via:
+        score = min(max(raw_score, 1e-6), 1.0 - 1e-6)
 
     Args:
         history: list returned by `fetch_client_history`; each element is
-                 {'round': int, 'accuracy': float, 'timestamp': int}.
+                 {'round': int, 'accuracy': float/int, 'timestamp': int}.
+                 NOTE: the accuracy value from fetch_client_history is already
+                 divided by 10000 (see blockchain.py).  This function handles
+                 both: if the value is > 1 it treats it as raw integer form.
 
     Returns:
-        float: PoC score in [0, 1].
-               Baseline 0.5 when no history exists.
-               Otherwise  avg(accuracy) * (len(history) / current_round),
-               where current_round is len(history) used as a proxy so that
-               the participation ratio is always <= 1.
+        float strictly in (0, 1).
     """
     if not history:
-        return 0.5
+        return 0.5   # baseline for unseen clients
 
-    accuracies = [entry["accuracy"] for entry in history]
-    avg_acc = float(np.mean(accuracies))
+    # Normalise: fetch_client_history already divides by 10000,
+    # but guard against raw integer leakage from direct contract reads.
+    acc_values = []
+    for entry in sorted(history, key=lambda e: e['round']):
+        raw = entry['accuracy']
+        normalised = raw / 10000.0 if raw > 1.0 else float(raw)
+        # Clamp individual accuracy to [0, 1]
+        normalised = min(max(normalised, 0.0), 1.0)
+        acc_values.append(normalised)
 
-    # participation ratio: rounds participated / total rounds seen
-    current_round = max(entry["round"] for entry in history)
-    if current_round == 0:
-        return avg_acc
+    ema_acc = _ema(acc_values, alpha=0.7)
 
-    participation = len(history) / current_round
-    poc_score = avg_acc * participation
-    return float(poc_score)
+    max_round = max(entry['round'] for entry in history)
+    if max_round <= 0:
+        participation = 1.0
+    else:
+        participation = len(history) / max_round          # ∈ (0, 1]
+
+    raw_score = ema_acc * participation
+
+    # Strict (0, 1) bound
+    score = min(max(raw_score, 1e-6), 1.0 - 1e-6)
+    return float(score)
 
 
 # ---------------------------------------------------------------------------
@@ -105,30 +137,25 @@ class PoCFedAvg(FedAvg):
         Override configure_fit to rank available clients by PoC score and
         select only the top-K fraction.
         """
-        config = {"local_epochs": 1, "server_round": server_round}
+        config  = {"local_epochs": 1, "server_round": server_round}
         fit_ins = FitIns(parameters, config)
 
-        # Sample all currently available clients
         sample_size = max(1, int(client_manager.num_available()))
-        clients = client_manager.sample(num_clients=sample_size)
+        clients     = client_manager.sample(num_clients=sample_size)
 
-        # Score each client by their on-chain history
         scored: List[Tuple[float, ClientProxy]] = []
         for proxy in clients:
-            # Map proxy to an Ethereum address by index (round-robin fallback)
             try:
                 idx = int(proxy.cid) % len(self.eth_accounts)
             except (ValueError, TypeError):
                 idx = 0
-            addr = self.eth_accounts[idx]
-
+            addr    = self.eth_accounts[idx]
             history = fetch_client_history(addr, self.contract, self.web3_instance)
-            score = calculate_score(history)
+            score   = calculate_score(history)
             scored.append((score, proxy))
 
-        # Sort descending by score, take top K
         scored.sort(key=lambda x: x[0], reverse=True)
-        top_k = max(1, round(len(scored) * self.top_k_fraction))
+        top_k    = max(1, round(len(scored) * self.top_k_fraction))
         selected = [proxy for _, proxy in scored[:top_k]]
 
         return [(proxy, fit_ins) for proxy in selected]

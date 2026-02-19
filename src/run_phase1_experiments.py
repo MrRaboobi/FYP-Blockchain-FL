@@ -1,12 +1,11 @@
 """
-Phase 1.5 — Experiment Automation & Plotting
-Runs two FL experiments (Baseline vs Active-Ledger) and generates:
-  - robustness_evaluation.pdf  (accuracy per round, both conditions)
-  - gas_overhead.pdf           (gas cost comparison bar chart)
+Phase 1.5 v2 — Experiment Automation & Plotting (10-client, 15 MIT-BIH records)
+Generates:
+  robustness_evaluation.pdf  — dual subplot: accuracy + round latency
+  gas_overhead.pdf           — gas cost bar chart
 """
 
 import sys
-import json
 import time
 from pathlib import Path
 from copy import deepcopy
@@ -15,67 +14,60 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend, safe on Windows
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-# Make src importable when run from repo root
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils import load_config
 from model import create_model, CNNLSTM
-from train_utils import (
-    load_client_data,
-    create_data_loaders,
-    train_epoch,
-    evaluate,
-    ECGDataset,
-)
-from torch.utils.data import DataLoader
+from train_utils import load_client_data, create_data_loaders, train_epoch, evaluate
 from blockchain import BlockchainManager, fetch_client_history
 from server import calculate_score
 
-# ── Constants ────────────────────────────────────────────────────────────────
-NUM_ROUNDS   = 10
-NUM_NORMAL   = 4
-NUM_MALICIOUS = 1
-TOTAL_CLIENTS = NUM_NORMAL + NUM_MALICIOUS   # 5
-TOP_K         = 4   # Active-Ledger selects this many per round
+# ── Experiment constants ──────────────────────────────────────────────────────
+NUM_ROUNDS    = 15
+NUM_NORMAL    = 8
+NUM_MALICIOUS = 2
+TOTAL_CLIENTS = 10     # NUM_NORMAL + NUM_MALICIOUS
+TOP_K         = 7      # Active-Ledger selects this many per round
 
-OUTPUT_DIR   = Path(__file__).parent.parent  # repo root
-GANACHE_URL  = "http://127.0.0.1:8545"
+OUTPUT_DIR  = Path(__file__).parent.parent   # repo root
+GANACHE_URL = "http://127.0.0.1:8545"
+
+assert TOTAL_CLIENTS == NUM_NORMAL + NUM_MALICIOUS, "client counts must sum"
 
 
-# ── Data helpers ─────────────────────────────────────────────────────────────
+# ── Data loading — NO synthetic fallback ─────────────────────────────────────
 
 def _load_client_loaders(config, total_clients, batch_size):
     """
-    Load/synthesise data loaders for `total_clients` clients.
-    If partitioned data for that client doesn't exist on disk, synthetically
-    generate a small random dataset so the experiment can always run.
+    Load data for `total_clients` clients from disk.
+    Raises FileNotFoundError if any client directory is missing (enforces
+    data integrity — synthetic fallback is intentionally removed).
     """
     partitioned_dir = Path(config["data"]["partitioned_dir"])
     loaders, val_loaders, sizes = [], [], []
 
     for cid in range(1, total_clients + 1):
         client_dir = partitioned_dir / f"client_{cid}"
-        if client_dir.exists():
-            data = load_client_data(cid, str(partitioned_dir))
-            X_train, y_train = data["X_train"], data["y_train"]
-            X_val,   y_val   = data["X_val"],   data["y_val"]
-        else:
-            # Synthetic fallback — random ECG-shaped data, 5 classes
-            rng = np.random.default_rng(seed=cid * 42)
-            n_train, n_val = 300, 60
-            X_train = rng.standard_normal((n_train, 360)).astype(np.float32)
-            y_train = rng.integers(0, 5, n_train)
-            X_val   = rng.standard_normal((n_val,   360)).astype(np.float32)
-            y_val   = rng.integers(0, 5, n_val)
-
-        tl, vl = create_data_loaders(X_train, y_train, X_val, y_val, batch_size)
+        if not client_dir.exists():
+            raise FileNotFoundError(
+                f"[FATAL] Partition not found: {client_dir}\n"
+                "Run: python src/download_data.py && "
+                "python src/preprocess_data.py && "
+                "python src/partition_data.py"
+            )
+        data = load_client_data(cid, str(partitioned_dir))
+        tl, vl = create_data_loaders(
+            data["X_train"], data["y_train"],
+            data["X_val"],   data["y_val"],
+            batch_size
+        )
         loaders.append(tl)
         val_loaders.append(vl)
-        sizes.append(len(y_train))
+        sizes.append(len(data["y_train"]))
 
     return loaders, val_loaders, sizes
 
@@ -93,40 +85,32 @@ def _set_weights(model, weights):
 
 
 def _fedavg_aggregate(global_model, client_weights_list, sizes):
-    """Weighted-average aggregation (FedAvg)."""
-    total = sum(sizes)
-    global_dict = global_model.state_dict()
+    total     = sum(sizes)
+    global_sd = global_model.state_dict()
+    param_keys = [k for k in global_sd if "num_batches_tracked" not in k]
     agg = {k: torch.zeros_like(v, dtype=torch.float32)
-           for k, v in global_dict.items()
-           if "num_batches_tracked" not in k}
-
-    param_keys = [k for k in global_dict if "num_batches_tracked" not in k]
+           for k, v in global_sd.items() if k in param_keys}
 
     for weights, size in zip(client_weights_list, sizes):
-        factor = size / total
-        tmp_model = deepcopy(global_model)
-        _set_weights(tmp_model, weights)
-        tmp_sd = tmp_model.state_dict()
+        factor   = size / total
+        tmp      = deepcopy(global_model)
+        _set_weights(tmp, weights)
+        tmp_sd   = tmp.state_dict()
         for k in param_keys:
             agg[k] += tmp_sd[k].float() * factor
 
-    new_sd = dict(global_dict)
+    new_sd = dict(global_sd)
     for k in param_keys:
-        new_sd[k] = agg[k].to(global_dict[k].dtype)
+        new_sd[k] = agg[k].to(global_sd[k].dtype)
     global_model.load_state_dict(new_sd)
     return global_model
 
 
 def _train_one_client(global_model, train_loader, val_loader,
                       local_epochs, lr, device, is_malicious=False):
-    """
-    Local training step for one client.
-    Returns (weights, num_samples, accuracy).
-    Malicious clients return Gaussian noise weights and accuracy=0.10.
-    """
     client_model = deepcopy(global_model).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(client_model.parameters(), lr=lr)
+    criterion    = nn.CrossEntropyLoss()
+    optimizer    = torch.optim.Adam(client_model.parameters(), lr=lr)
 
     client_model.train()
     for _ in range(local_epochs):
@@ -138,74 +122,25 @@ def _train_one_client(global_model, train_loader, val_loader,
     n_samples   = len(train_loader.dataset)
 
     if is_malicious:
-        noisy = [np.random.normal(0, 1, w.shape).astype(np.float32)
-                 for w in weights]
+        noisy = [np.random.normal(0, 1, w.shape).astype(np.float32) for w in weights]
         return noisy, n_samples, 0.10
 
     return weights, n_samples, honest_acc
 
 
 def _global_eval(global_model, val_loaders, device):
-    """Average accuracy across all clients' val loaders."""
     criterion = nn.CrossEntropyLoss()
-    accs = []
-    for vl in val_loaders:
-        m = evaluate(global_model, vl, criterion, device)
-        accs.append(m["accuracy"])
+    accs = [evaluate(global_model, vl, criterion, device)["accuracy"]
+            for vl in val_loaders]
     return float(np.mean(accs))
 
 
-# ── Experiment A: Baseline Standard FedAvg ───────────────────────────────────
+# ── Experiment A: Baseline FedAvg ────────────────────────────────────────────
 
 def run_baseline(config, loaders, val_loaders, sizes, device):
-    """
-    Standard FedAvg: all 5 clients participate every round (including malicious).
-    Records global accuracy per round.
-    """
     print("\n" + "=" * 60)
     print("EXPERIMENT A — Standard FedAvg (Baseline)")
-    print("=" * 60)
-
-    local_epochs = config["federated"]["local_epochs"]
-    lr           = config["model"]["learning_rate"]
-    global_model = create_model(config).to(device)
-    malicious_ids = set(range(NUM_NORMAL, TOTAL_CLIENTS))  # last client is malicious
-
-    round_accs = []
-    for rnd in range(1, NUM_ROUNDS + 1):
-        client_weights, client_sizes = [], []
-
-        for cid in range(TOTAL_CLIENTS):
-            is_mal = cid in malicious_ids
-            w, n, acc = _train_one_client(
-                global_model, loaders[cid], val_loaders[cid],
-                local_epochs, lr, device, is_malicious=is_mal
-            )
-            client_weights.append(w)
-            client_sizes.append(n)
-
-        # Aggregate ALL clients (including malicious — no defence)
-        global_model = _fedavg_aggregate(global_model, client_weights, client_sizes)
-        g_acc = _global_eval(global_model, val_loaders, device)
-        round_accs.append(g_acc)
-        print(f"  Round {rnd:2d}/{NUM_ROUNDS}  global_val_acc={g_acc:.4f}")
-
-    return round_accs
-
-
-# ── Experiment B: Active-Ledger with PoC Selection ────────────────────────────
-
-def run_active_ledger(config, loaders, val_loaders, sizes, device, blockchain: BlockchainManager):
-    """
-    Active-Ledger FedAvg:
-      - Each client trains locally.
-      - After training, the server logs the update on-chain (emits ModelUpdate).
-      - Client selection for next round is filtered by PoC score from on-chain
-        history; only top-K clients are included in the aggregation.
-    Records global accuracy per round.
-    """
-    print("\n" + "=" * 60)
-    print("EXPERIMENT B — Active-Ledger FedAvg (PoC Selection)")
+    print(f"  {NUM_NORMAL} normal + {NUM_MALICIOUS} malicious, all included each round")
     print("=" * 60)
 
     local_epochs  = config["federated"]["local_epochs"]
@@ -213,124 +148,165 @@ def run_active_ledger(config, loaders, val_loaders, sizes, device, blockchain: B
     global_model  = create_model(config).to(device)
     malicious_ids = set(range(NUM_NORMAL, TOTAL_CLIENTS))
 
-    # Map each simulated client-id to an Ethereum account (round-robin)
-    eth_accounts = blockchain.w3.eth.accounts[:TOTAL_CLIENTS]
-    # Pad if Ganache has fewer than TOTAL_CLIENTS accounts
-    while len(eth_accounts) < TOTAL_CLIENTS:
-        eth_accounts = list(eth_accounts) + [blockchain.deployer]
-
-    round_accs = []
+    round_accs, round_latencies = [], []
 
     for rnd in range(1, NUM_ROUNDS + 1):
-        all_results  = []   # (client_idx, weights, size, accuracy, eth_addr)
-
-        # — Local training (all clients) —
+        t_start = time.time()
+        cw, cs  = [], []
         for cid in range(TOTAL_CLIENTS):
-            is_mal = cid in malicious_ids
+            w, n, _ = _train_one_client(
+                global_model, loaders[cid], val_loaders[cid],
+                local_epochs, lr, device, is_malicious=(cid in malicious_ids)
+            )
+            cw.append(w); cs.append(n)
+
+        global_model = _fedavg_aggregate(global_model, cw, cs)
+        g_acc  = _global_eval(global_model, val_loaders, device)
+        t_rnd  = time.time() - t_start
+
+        round_accs.append(g_acc)
+        round_latencies.append(t_rnd)
+        print(f"  Round {rnd:2d}/{NUM_ROUNDS}  acc={g_acc:.4f}  latency={t_rnd:.1f}s")
+
+    return round_accs, round_latencies
+
+
+# ── Experiment B: Active-Ledger FedAvg ───────────────────────────────────────
+
+def run_active_ledger(config, loaders, val_loaders, sizes, device,
+                      blockchain: BlockchainManager):
+    print("\n" + "=" * 60)
+    print("EXPERIMENT B — Active-Ledger FedAvg (PoC Selection)")
+    print(f"  top-K={TOP_K} clients selected per round via on-chain PoC score")
+    print("=" * 60)
+
+    local_epochs  = config["federated"]["local_epochs"]
+    lr            = config["model"]["learning_rate"]
+    global_model  = create_model(config).to(device)
+    malicious_ids = set(range(NUM_NORMAL, TOTAL_CLIENTS))
+
+    # Ethereum accounts — use as many as Ganache provides
+    eth_accounts = list(blockchain.w3.eth.accounts)
+    while len(eth_accounts) < TOTAL_CLIENTS:
+        eth_accounts.append(blockchain.deployer)
+
+    round_accs, round_latencies = [], []
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        t_start = time.time()
+
+        # Local training
+        results = []
+        for cid in range(TOTAL_CLIENTS):
             w, n, acc = _train_one_client(
                 global_model, loaders[cid], val_loaders[cid],
-                local_epochs, lr, device, is_malicious=is_mal
+                local_epochs, lr, device, is_malicious=(cid in malicious_ids)
             )
-            all_results.append((cid, w, n, acc, eth_accounts[cid]))
+            results.append((cid, w, n, acc, eth_accounts[cid]))
 
-        # — On-chain logging (all participated clients) —
-        for cid, w, n, acc, addr in all_results:
+        # On-chain logging
+        for cid, w, n, acc, addr in results:
             try:
-                # Use eth account directly as the transaction sender
-                acc_int   = int(acc * 10000)
+                acc_int    = int(acc * 10000)
                 dummy_hash = bytes([cid % 256] * 32)
                 tx = blockchain.contract.functions.logUpdate(
                     rnd, cid + 1, dummy_hash, n, acc_int
                 ).transact({"from": addr})
                 blockchain.w3.eth.wait_for_transaction_receipt(tx)
             except Exception as e:
-                # Non-fatal: continue experiment if a log tx fails
-                print(f"    [warn] blockchain log failed for client {cid+1}: {e}")
+                print(f"    [warn] blockchain log failed cid={cid+1}: {e}")
 
-        # — PoC-based client selection for aggregation —
+        # PoC selection
         scored = []
-        for cid, w, n, acc, addr in all_results:
+        for cid, w, n, acc, addr in results:
             history = fetch_client_history(addr, blockchain.contract, blockchain.w3)
             score   = calculate_score(history)
             scored.append((score, cid, w, n))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        selected = scored[:TOP_K]
-
+        selected   = scored[:TOP_K]
         sel_weights = [w for _, _, w, _ in selected]
         sel_sizes   = [n for _, _, _, n in selected]
 
-        # — Aggregate only selected (high-PoC) clients —
         global_model = _fedavg_aggregate(global_model, sel_weights, sel_sizes)
-        g_acc = _global_eval(global_model, val_loaders, device)
+        g_acc  = _global_eval(global_model, val_loaders, device)
+        t_rnd  = time.time() - t_start
+
         round_accs.append(g_acc)
-
+        round_latencies.append(t_rnd)
+        top_ids    = [c + 1 for _, c, _, _ in selected]
         top_scores = [f"{s:.3f}" for s, *_ in selected]
-        print(f"  Round {rnd:2d}/{NUM_ROUNDS}  selected={[c+1 for _,c,_,_ in selected]}"
-              f"  scores={top_scores}  global_val_acc={g_acc:.4f}")
+        print(f"  Round {rnd:2d}/{NUM_ROUNDS}  sel={top_ids}  scores={top_scores}"
+              f"  acc={g_acc:.4f}  latency={t_rnd:.1f}s")
 
-    return round_accs
+    return round_accs, round_latencies
 
 
-# ── Gas Cost Estimation ────────────────────────────────────────────────────────
+# ── Gas cost estimation ───────────────────────────────────────────────────────
 
 def estimate_gas_costs(blockchain: BlockchainManager):
-    """
-    Estimate on-chain gas cost of two approaches using eth_estimateGas:
-      1. logUpdate() — which now emits the ModelUpdate event (current approach)
-      2. A hypothetical function that pushes a 64-element uint256 array to storage
-         (array-push pattern — simulated via repeated SSTORE estimation)
-
-    Returns:
-        (gas_event: int, gas_array: int)
-    """
-    deployer = blockchain.deployer
+    deployer  = blockchain.deployer
     contract  = blockchain.contract
 
-    # Cost of current logUpdate (emits event)
     gas_event = contract.functions.logUpdate(
         1, 1, b"\x00" * 32, 1000, 9000
     ).estimate_gas({"from": deployer})
 
-    # Hypothetical array-push: We estimate SSTORE overhead for a 64-element
-    # uint256 array relative to a single-value write.
-    # An SSTORE to a fresh slot costs 20000 gas (Berlin/London EIP-2929).
-    # A 64-element push therefore costs approximately 64 * SSTORE_COLD.
+    # Hypothetical array-push: 64 × cold SSTORE (EIP-2929) + call overhead
     SSTORE_COLD = 20_000
     CALL_OVERHEAD = 21_000
-    ARRAY_WRITE_ELEMENTS = 64
-    gas_array = CALL_OVERHEAD + ARRAY_WRITE_ELEMENTS * SSTORE_COLD
+    gas_array = CALL_OVERHEAD + 64 * SSTORE_COLD
 
     return gas_event, gas_array
 
 
-# ── Plot helpers ──────────────────────────────────────────────────────────────
+# ── Plotting ──────────────────────────────────────────────────────────────────
 
-FONT_SIZE  = 11
-COLOR_BASE = "#2C7BB6"
-COLOR_POC  = "#D7191C"
-COLOR_BAR1 = "#4D9DE0"
-COLOR_BAR2 = "#E15554"
+C_BASE = "#2C7BB6"
+C_POC  = "#D7191C"
+C_BAR1 = "#4D9DE0"
+C_BAR2 = "#E15554"
+FS     = 10
 
 
-def plot_robustness(baseline_accs, active_accs, output_path):
+def plot_robustness(baseline_accs, baseline_lat, active_accs, active_lat, output_path):
+    """
+    Dual-subplot PDF:
+      Top    : Global Validation Accuracy vs Round
+      Bottom : Round Latency (seconds) vs Round
+    """
     rounds = list(range(1, len(baseline_accs) + 1))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(rounds, baseline_accs, marker="o", linewidth=2,
-            color=COLOR_BASE, label="Standard FedAvg")
-    ax.plot(rounds, active_accs,  marker="s", linewidth=2,
-            color=COLOR_POC,  label="Active-Ledger (PoC)")
+    # — Top subplot: accuracy —
+    ax1.plot(rounds, baseline_accs, marker="o", lw=2, color=C_BASE,
+             label="Standard FedAvg")
+    ax1.plot(rounds, active_accs,   marker="s", lw=2, color=C_POC,
+             label="Active-Ledger (PoC)")
+    ax1.set_ylabel("Global Validation Accuracy", fontsize=FS)
+    ax1.set_title(
+        f"Robustness Evaluation Under Byzantine Attack\n"
+        f"({NUM_NORMAL} normal + {NUM_MALICIOUS} Byzantine clients, "
+        f"{NUM_ROUNDS} rounds)",
+        fontsize=FS + 1
+    )
+    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
+    ax1.legend(fontsize=FS)
+    ax1.grid(True, linestyle="--", alpha=0.45)
 
-    ax.set_xlabel("Communication Round", fontsize=FONT_SIZE)
-    ax.set_ylabel("Global Validation Accuracy", fontsize=FONT_SIZE)
-    ax.set_title("Robustness Evaluation Under Byzantine Attack\n"
-                 f"({NUM_NORMAL} normal + {NUM_MALICIOUS} malicious client)",
-                 fontsize=FONT_SIZE + 1)
-    ax.set_xticks(rounds)
-    ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
-    ax.legend(fontsize=FONT_SIZE)
-    ax.grid(True, linestyle="--", alpha=0.5)
+    # — Bottom subplot: latency —
+    ax2.plot(rounds, baseline_lat, marker="o", lw=2, color=C_BASE,
+             label="Standard FedAvg")
+    ax2.plot(rounds, active_lat,   marker="s", lw=2, color=C_POC,
+             label="Active-Ledger (PoC)")
+    ax2.set_xlabel("Communication Round", fontsize=FS)
+    ax2.set_ylabel("Round Latency (seconds)", fontsize=FS)
+    ax2.set_title("Average Round Latency vs Communication Round", fontsize=FS + 1)
+    ax2.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+    ax2.legend(fontsize=FS)
+    ax2.grid(True, linestyle="--", alpha=0.45)
+
+    plt.xticks(rounds)
     fig.tight_layout()
     fig.savefig(output_path, format="pdf", bbox_inches="tight")
     plt.close(fig)
@@ -340,20 +316,18 @@ def plot_robustness(baseline_accs, active_accs, output_path):
 def plot_gas_overhead(gas_event, gas_array, output_path):
     labels = ["logUpdate()\n(Event-Emit)", "Hypothetical\n(Array-Push ×64)"]
     values = [gas_event, gas_array]
-    colors = [COLOR_BAR1, COLOR_BAR2]
-
     fig, ax = plt.subplots(figsize=(6, 5))
-    bars = ax.bar(labels, values, color=colors, width=0.5, edgecolor="white")
-
+    bars = ax.bar(labels, values, color=[C_BAR1, C_BAR2], width=0.5, edgecolor="white")
     for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
-                f"{val:,}", ha="center", va="bottom", fontsize=FONT_SIZE)
-
-    ax.set_ylabel("Estimated Gas Units", fontsize=FONT_SIZE)
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(values) * 0.01,
+                f"{val:,}", ha="center", va="bottom", fontsize=FS)
+    ax.set_ylabel("Estimated Gas Units", fontsize=FS)
     ax.set_title("On-Chain Gas Cost Comparison\n"
-                 "Event-emit vs. Array-storage pattern",
-                 fontsize=FONT_SIZE + 1)
-    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+                 "Event-emit vs. Array-storage pattern", fontsize=FS + 1)
+    ax.yaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda x, _: f"{int(x):,}")
+    )
     ax.set_ylim(0, max(values) * 1.18)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     fig.tight_layout()
@@ -368,60 +342,53 @@ def main():
     np.random.seed(42)
     torch.manual_seed(42)
 
-    config = load_config()
-    device = torch.device("cpu")
-
-    batch_size   = config["training"]["batch_size"]
-    total_clients = TOTAL_CLIENTS
+    config     = load_config()
+    device     = torch.device("cpu")
+    batch_size = config["training"]["batch_size"]
 
     print("=" * 60)
-    print("PHASE 1.5 — EXPERIMENT AUTOMATION")
+    print("PHASE 1.5 v2 — EXPERIMENT AUTOMATION (10-client)")
     print("=" * 60)
-    print(f"  Clients  : {NUM_NORMAL} normal + {NUM_MALICIOUS} malicious")
+    print(f"  Clients  : {NUM_NORMAL} normal + {NUM_MALICIOUS} malicious = {TOTAL_CLIENTS}")
     print(f"  Rounds   : {NUM_ROUNDS}")
-    print(f"  Top-K    : {TOP_K}  (Active-Ledger selection)")
+    print(f"  Top-K    : {TOP_K}")
 
-    # ── Load data ────────────────────────────────────────────────────────────
-    print("\n[..] Loading client data ...")
-    loaders, val_loaders, sizes = _load_client_loaders(config, total_clients, batch_size)
-    print(f"[OK] Loaded {total_clients} client datasets: {sizes}")
+    # Load real partitioned data (no fallback)
+    print("\n[..] Loading client data (no synthetic fallback) ...")
+    loaders, val_loaders, sizes = _load_client_loaders(config, TOTAL_CLIENTS, batch_size)
+    print(f"[OK] Loaded {TOTAL_CLIENTS} clients: {sizes}")
 
-    # ── Blockchain init ───────────────────────────────────────────────────────
+    # Blockchain
     print("\n[..] Connecting to blockchain ...")
-    try:
-        blockchain = BlockchainManager(GANACHE_URL)
-    except Exception as e:
-        print(f"[FAIL] Blockchain init: {e}")
-        raise
+    blockchain = BlockchainManager(GANACHE_URL)
 
-    # ── Experiment A ──────────────────────────────────────────────────────────
+    # Experiments
     t0 = time.time()
-    baseline_accs = run_baseline(config, loaders, val_loaders, sizes, device)
+    baseline_accs, baseline_lat = run_baseline(config, loaders, val_loaders, sizes, device)
     print(f"\n[A] Baseline done in {time.time()-t0:.1f}s")
 
-    # ── Experiment B ──────────────────────────────────────────────────────────
     t1 = time.time()
-    active_accs = run_active_ledger(config, loaders, val_loaders, sizes, device, blockchain)
+    active_accs, active_lat = run_active_ledger(
+        config, loaders, val_loaders, sizes, device, blockchain
+    )
     print(f"\n[B] Active-Ledger done in {time.time()-t1:.1f}s")
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
+    # Plots
     print("\n[..] Generating plots ...")
     plot_robustness(
-        baseline_accs, active_accs,
+        baseline_accs, baseline_lat,
+        active_accs,   active_lat,
         OUTPUT_DIR / "robustness_evaluation.pdf"
     )
 
     gas_event, gas_array = estimate_gas_costs(blockchain)
-    print(f"[OK] Gas — logUpdate (event): {gas_event:,}  |  hypothetical array-push: {gas_array:,}")
-    plot_gas_overhead(
-        gas_event, gas_array,
-        OUTPUT_DIR / "gas_overhead.pdf"
-    )
+    print(f"[OK] Gas — logUpdate (event): {gas_event:,} | array-push: {gas_array:,}")
+    plot_gas_overhead(gas_event, gas_array, OUTPUT_DIR / "gas_overhead.pdf")
 
     print("\n" + "=" * 60)
-    print("PHASE 1.5 COMPLETE")
-    print(f"  robustness_evaluation.pdf -> {OUTPUT_DIR}")
-    print(f"  gas_overhead.pdf          -> {OUTPUT_DIR}")
+    print("PHASE 1.5 v2 COMPLETE")
+    print(f"  robustness_evaluation.pdf  -> {OUTPUT_DIR}")
+    print(f"  gas_overhead.pdf           -> {OUTPUT_DIR}")
     print("=" * 60)
 
 
